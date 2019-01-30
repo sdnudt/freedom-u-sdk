@@ -30,11 +30,15 @@ linux_defconfig := $(confdir)/linux_defconfig
 
 vmlinux := $(linux_wrkdir)/vmlinux
 vmlinux_stripped := $(linux_wrkdir)/vmlinux-stripped
+vmlinux_bin := $(wrkdir)/vmlinux.bin
+
+initramfs := $(wrkdir)/initramfs.cpio.gz
 
 pk_srcdir := $(srcdir)/riscv-pk
 pk_wrkdir := $(wrkdir)/riscv-pk
 bbl := $(pk_wrkdir)/bbl
-bin := $(wrkdir)/bbl.bin
+bbl_bin := $(wrkdir)/bbl.bin
+fit := $(wrkdir)/image.fit
 hex := $(wrkdir)/bbl.hex
 
 fesvr_srcdir := $(srcdir)/riscv-fesvr
@@ -48,6 +52,10 @@ spike := $(spike_wrkdir)/prefix/bin/spike
 qemu_srcdir := $(srcdir)/riscv-qemu
 qemu_wrkdir := $(wrkdir)/riscv-qemu
 qemu := $(qemu_wrkdir)/prefix/bin/qemu-system-riscv64
+
+uboot_srcdir := $(srcdir)/HiFive_U-Boot
+uboot_wrkdir := $(wrkdir)/HiFive_U-Boot
+uboot := $(uboot_wrkdir)/u-boot.bin
 
 rootfs := $(wrkdir)/rootfs.bin
 
@@ -133,15 +141,28 @@ endif
 
 $(vmlinux): $(linux_srcdir) $(linux_wrkdir)/.config $(buildroot_initramfs_sysroot_stamp)
 	$(MAKE) -C $< O=$(linux_wrkdir) \
-		CONFIG_INITRAMFS_SOURCE="$(confdir)/initramfs.txt $(buildroot_initramfs_sysroot)" \
-		CONFIG_INITRAMFS_ROOT_UID=$(shell id -u) \
-		CONFIG_INITRAMFS_ROOT_GID=$(shell id -g) \
-		CROSS_COMPILE=riscv64-unknown-linux-gnu- \
 		ARCH=riscv \
+		CROSS_COMPILE=$(target)- \
 		vmlinux
+
+.PHONY: initrd
+initrd: $(initramfs)
+
+$(initramfs).d:
+	$(linux_srcdir)/scripts/gen_initramfs_list.sh -l $(confdir)/initramfs.txt $(buildroot_initramfs_sysroot) > $@
+
+$(initramfs):
+	cd $(linux_wrkdir) && \
+		$(linux_srcdir)/scripts/gen_initramfs_list.sh \
+		-o $@ -u $(shell id -u) -g $(shell id -g) \
+		$(confdir)/initramfs.txt \
+		$(buildroot_initramfs_sysroot) 
 
 $(vmlinux_stripped): $(vmlinux)
 	$(target)-strip -o $@ $<
+
+$(vmlinux_bin): $(vmlinux)
+	$(target)-objcopy -O binary $< $@
 
 .PHONY: linux-menuconfig
 linux-menuconfig: $(linux_wrkdir)/.config
@@ -154,15 +175,17 @@ $(bbl): $(pk_srcdir) $(vmlinux_stripped)
 	mkdir -p $(pk_wrkdir)
 	cd $(pk_wrkdir) && $</configure \
 		--host=$(target) \
-		--with-payload=$(vmlinux_stripped) \
 		--enable-logo \
 		--with-logo=$(abspath conf/sifive_logo.txt)
 	CFLAGS="-mabi=$(ABI) -march=$(ISA)" $(MAKE) -C $(pk_wrkdir)
 
-$(bin): $(bbl)
+$(bbl_bin): $(bbl)
 	$(target)-objcopy -S -O binary --change-addresses -0x80000000 $< $@
 
-$(hex):	$(bin)
+$(fit): $(bbl_bin) $(vmlinux_bin) $(uboot) $(initramfs) $(confdir)/uboot-fit-image.its
+	$(uboot_wrkdir)/tools/mkimage -f $(confdir)/uboot-fit-image.its -A riscv -O linux -T flat_dt $@
+
+$(hex):	$(bbl_bin)
 	xxd -c1 -p $< > $@
 
 $(libfesvr): $(fesvr_srcdir)
@@ -197,13 +220,21 @@ $(qemu): $(qemu_srcdir)
 	$(MAKE) -C $(qemu_wrkdir) install
 	touch -c $@
 
+$(uboot): $(uboot_srcdir)
+	rm -rf $(uboot_wrkdir)
+	mkdir -p $(uboot_wrkdir)
+	mkdir -p $(dir $@)
+	$(MAKE) -C $(uboot_srcdir) O=$(uboot_wrkdir) HiFive-U540_regression_defconfig
+	$(MAKE) -C $(uboot_srcdir) O=$(uboot_wrkdir) CROSS_COMPILE=$(target)-
+
 $(rootfs): $(buildroot_rootfs_ext)
 	cp $< $@
 
-.PHONY: buildroot_initramfs_sysroot vmlinux bbl
+.PHONY: buildroot_initramfs_sysroot vmlinux bbl fit
 buildroot_initramfs_sysroot: $(buildroot_initramfs_sysroot)
 vmlinux: $(vmlinux)
 bbl: $(bbl)
+fit: $(fit)
 
 .PHONY: clean
 clean:
@@ -214,36 +245,61 @@ sim: $(spike) $(bbl)
 	$(spike) --isa=$(ISA) -p4 $(bbl)
 
 .PHONY: qemu
-qemu: $(qemu) $(bbl) $(rootfs)
-	$(qemu) -nographic -machine virt -kernel $(bbl) \
+qemu: $(qemu) $(bbl) $(rootfs) $(initramfs)
+	$(qemu) -nographic -machine virt -bios $(bbl) -kernel $(vmlinux) -initrd $(initramfs) \
 		-drive file=$(rootfs),format=raw,id=hd0 -device virtio-blk-device,drive=hd0 \
 		-netdev user,id=net0 -device virtio-net-device,netdev=net0
 
+.PHONY: uboot
+uboot: $(uboot)
+
 # Relevant partition type codes
-BBL   = 2E54B353-1271-4842-806F-E436D6AF6985
-LINUX = 0FC63DAF-8483-4772-8E79-3D69D8477DE4
-FSBL  = 5B193300-FC78-40CD-8002-E86C45580B47
+BBL		= 2E54B353-1271-4842-806F-E436D6AF6985
+VFAT            = EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
+LINUX		= 0FC63DAF-8483-4772-8E79-3D69D8477DE4
+#FSBL		= 5B193300-FC78-40CD-8002-E86C45580B47
+UBOOT		= 5B193300-FC78-40CD-8002-E86C45580B47
+UBOOTENV	= a09354ac-cd63-11e8-9aff-70b3d592f0fa
+UBOOTDTB	= 070dd1a8-cd64-11e8-aa3d-70b3d592f0fa
+UBOOTFIT	= 04ffcafa-cd65-11e8-b974-70b3d592f0fa
 
 .PHONY: format-boot-loader
-format-boot-loader: $(bin)
+format-boot-loader: $(bbl_bin) $(uboot)
 	@test -b $(DISK) || (echo "$(DISK): is not a block device"; exit 1)
-	sgdisk --clear                                                               \
-		--new=1:2048:67583  --change-name=1:bootloader --typecode=1:$(BBL)   \
+	/sbin/sgdisk --clear                                                               \
+		--new=1:2048:67583  --change-name=1:Vfat Boot  --typecode=1:$(VFAT)   \
 		--new=2:264192:     --change-name=2:root       --typecode=2:$(LINUX) \
+		--new=3:1248:2047   --change-name=3:uboot      --typecode=3:$(UBOOT) \
+		--new=4:1024:1247   --change-name=4:env        --typecode=4:$(UBOOTENV) \
 		$(DISK)
+	#/sbin/partprobe
 	@sleep 1
 ifeq ($(DISK)p1,$(wildcard $(DISK)p1))
 	@$(eval PART1 := $(DISK)p1)
 	@$(eval PART2 := $(DISK)p2)
+	@$(eval PART3 := $(DISK)p3)
+	@$(eval PART4 := $(DISK)p4)
 else ifeq ($(DISK)s1,$(wildcard $(DISK)s1))
 	@$(eval PART1 := $(DISK)s1)
 	@$(eval PART2 := $(DISK)s2)
+	@$(eval PART3 := $(DISK)s3)
+	@$(eval PART4 := $(DISK)s4)
 else ifeq ($(DISK)1,$(wildcard $(DISK)1))
 	@$(eval PART1 := $(DISK)1)
 	@$(eval PART2 := $(DISK)2)
+	@$(eval PART3 := $(DISK)3)
+	@$(eval PART4 := $(DISK)4)
 else
 	@echo Error: Could not find bootloader partition for $(DISK)
 	@exit 1
 endif
-	dd if=$< of=$(PART1) bs=4096
-	mke2fs -t ext3 $(PART2)
+	dd if=$(bbl_bin) of=$(PART1) bs=4096
+	dd if=$(uboot) of=$(PART3) bs=4096
+	/sbin/mkfs.vfat $(PART1)
+	/sbin/mke2fs -t ext3 $(PART2)
+	echo "Please mount and copy work/image.fit & conf/uEnv.txt to the MSDOS(vfat) partition"
+	#mount $(PART1) some/mount/path
+	#cp work/image.fit conf/uEnv.txt some/mount/path hifiveu.fit
+	#umount some/mount/path
+
+-include $(initramfs).d
