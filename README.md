@@ -74,6 +74,14 @@ The mode select switches should be set as follows:
  |        RTCSEL-----/ 0 1 2 3 <--MSEL                     |
  |                                                         |
 ```
+## Booting Debian on Freedom Unleashed dev board
+Modify the uENV.txt file（line8 to line18） according to your actual hardware conditions.
+
+Install a Debian snapshot to the Linux partition
+
+`make DISK=/dev/sdX format-demo-image`
+
+You can boot Debian on Freedom Unleashed dev board.
 
 ## Booting Linux on a simulator
 
